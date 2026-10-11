@@ -172,14 +172,14 @@ if __name__ == "__main__":
         if os.path.isdir(folder):
             stitch_tiles_to_geotiff(name, tile_list, output_name=f"{name}_mosaic_{name}.tif")
 
-    result = merge_two_sources("google", "esri", output_name="combined.tif")
+    result = merge_two_sources("google", "esri", output_name="combined_block.tif")
 
     fig, ax = plt.subplots(1, 1, figsize=(12, 12))
 
     ax.imshow(result.transpose(1, 2, 0))
-    ax.set_title("Результат")
+    ax.set_title("Блочное склеивание")
     ax.axis("off")
 
     plt.tight_layout()
-    plt.savefig("combined_result.png", dpi=100)
+    plt.savefig("combined_block.png", dpi=100)
     plt.show()
