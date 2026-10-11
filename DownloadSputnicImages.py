@@ -2,31 +2,52 @@ import os
 import math
 import time
 import requests
-import numpy as np
-import rasterio
-from rasterio.transform import from_origin
-from PIL import Image
 from retry import retry
+from datetime import datetime
 
-OUTPUT_DIR = "satellite_tiles"
-ZOOM = 14
-LAT_MIN, LAT_MAX = 55.55, 55.85
-LON_MIN, LON_MAX = 37.35, 37.75
+from Config import (
+    OUTPUT_DIR, ZOOM, LAT_MIN, LAT_MAX, LON_MIN, LON_MAX,
+    SEASON, SEASON_MONTHS,
+)
 
-SOURCES = {
-    "google": "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
-    "yandex": "https://sat01.maps.yandex.net/tiles?l=sat&x={x}&y={y}&z={z}"
-}
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 DELAY = 1.0
-TILE_SIZE = 256
+
+SOURCES = {
+    "google": "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
+    "esri": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+}
+
+WAYBACK_RELEASES = [
+    (56102, "2023-12-07"),
+    (55136, "2023-07-15"),
+    (43072, "2023-01-10"),
+    (46789, "2022-06-30"),
+    (39284, "2022-02-20"),
+    (31876, "2021-06-10"),
+    (26376, "2020-12-20"),
+    (21521, "2020-06-15"),
+    (20337, "2024-09-19"),
+    (56450, "2024-10-10"),
+    (49849, "2024-11-18"),
+    (52930, "2024-05-09"),
+    (12428, "2024-06-06"),
+    (60013, "2024-03-07"),
+]
+
+WAYBACK_TILE_TEMPLATE = (
+    "https://wayback.maptiles.arcgis.com/arcgis/rest/services/"
+    "World_Imagery/WMTS/1.0.0/default028mm/MapServer/tile/"
+    "{release_num}/{z}/{y}/{x}"
+)
 
 
 def lat_lon_to_tile(lat, lon, zoom):
-    x = (lon + 180) / 360 * (2 ** zoom)
-    y = (1 - math.log(math.tan(math.radians(lat)) + 1 / math.cos(math.radians(lat))) / math.pi) / 2 * (2 ** zoom)
-    return int(x), int(y)
+    n = 2 ** zoom
+    x = int((lon + 180) / 360 * n)
+    y = int((1 - math.log(math.tan(math.radians(lat)) + 1 / math.cos(math.radians(lat))) / math.pi) / 2 * n)
+    return x, y
 
 
 def get_tile_range(lat_min, lat_max, lon_min, lon_max, zoom):
@@ -45,128 +66,61 @@ def get_tile_range(lat_min, lat_max, lon_min, lon_max, zoom):
 
 @retry(tries=3, delay=2)
 def download_tile(url, save_path):
-    resp = requests.get(url, headers=HEADERS, timeout=10)
-    if resp.status_code == 200:
+    resp = requests.get(url, headers=HEADERS, timeout=15)
+    if resp.status_code == 200 and len(resp.content) > 100:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        with open(save_path, 'wb') as f:
+        with open(save_path, "wb") as f:
             f.write(resp.content)
         return True
     return False
 
 
-def download_all_tiles(source_name, url_template, tile_list):
-    print(f"\n=== Скачиваю {source_name} ===")
+def download_all_tiles(source_name, url_template, tile_list, extra_format=None):
     for x, y, z in tile_list:
-        url = url_template.format(x=x, y=y, z=z)
+        if extra_format:
+            url = url_template.format(**extra_format, x=x, y=y, z=z)
+        else:
+            url = url_template.format(x=x, y=y, z=z)
+
         save_path = f"{OUTPUT_DIR}/{source_name}/{z}/{x}/{y}.jpg"
 
         if os.path.exists(save_path):
             continue
 
         try:
-            ok = download_tile(url, save_path)
-            if ok:
-                print(f"✓ {source_name} z{z}/x{x}/y{y}")
-            else:
-                print(f"✗ {source_name} z{z}/x{x}/y{y} (ошибка)")
-        except Exception as e:
-            print(f"✗ {source_name} z{z}/x{x}/y{y} ({e})")
+            download_tile(url, save_path)
+        except Exception:
+            pass
 
         time.sleep(DELAY)
 
 
-def tile_bounds(x, y, z):
-    n = 2.0 ** z
-    lon_left = x / n * 360.0 - 180.0
-    lon_right = (x + 1) / n * 360.0 - 180.0
-    lat_top = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / n))))
-    lat_bottom = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (y + 1) / n))))
+def pick_season_release(season):
+    months = SEASON_MONTHS[season.lower()]
+    candidates = []
 
-    R = 6378137.0
-    x_left = math.radians(lon_left) * R
-    x_right = math.radians(lon_right) * R
-    y_top = math.log(math.tan(math.pi / 4 + math.radians(lat_top) / 2)) * R
-    y_bottom = math.log(math.tan(math.pi / 4 + math.radians(lat_bottom) / 2)) * R
+    for release_num, date_str in WAYBACK_RELEASES:
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        if dt.month in months:
+            candidates.append((release_num, date_str, dt))
 
-    return x_left, y_bottom, x_right, y_top
+    if not candidates:
+        raise RuntimeError(f"Не нашлось релизов для сезона '{season}'")
 
-
-def get_mosaic_transform(tile_list, zoom):
-    xs = sorted(set(x for x, _, _ in tile_list))
-    ys = sorted(set(y for _, y, _ in tile_list))
-
-    x_left, _, _, _ = tile_bounds(xs[0], ys[0], zoom)
-    _, _, x_right, _ = tile_bounds(xs[-1], ys[-1], zoom)
-    _, _, _, y_top = tile_bounds(xs[0], ys[0], zoom)
-    _, y_bottom, _, _ = tile_bounds(xs[-1], ys[-1], zoom)
-
-    width = len(xs) * TILE_SIZE
-    height = len(ys) * TILE_SIZE
-
-    pixel_size_x = (x_right - x_left) / width
-    pixel_size_y = (y_top - y_bottom) / height
-
-    transform = from_origin(x_left, y_top, pixel_size_x, pixel_size_y)
-    return transform, width, height, xs, ys
-
-
-def stitch_tiles_to_geotiff(source_name, tile_list, output_name="mosaic.tif"):
-    transform, width, height, xs, ys = get_mosaic_transform(tile_list, ZOOM)
-
-    mosaic = np.zeros((height, width, 3), dtype=np.uint8)
-
-    print(f"\n=== Склеиваю {source_name} в GeoTIFF ===")
-    for x, y, _ in tile_list:
-        path = f"{OUTPUT_DIR}/{source_name}/{ZOOM}/{x}/{y}.jpg"
-        if not os.path.exists(path):
-            print(f"  Пропускаю {x},{y} (файл не найден)")
-            continue
-
-        try:
-            img = Image.open(path).convert("RGB")
-            if img.size != (TILE_SIZE, TILE_SIZE):
-                img = img.resize((TILE_SIZE, TILE_SIZE))
-            arr = np.array(img)
-
-            col = xs.index(x)
-            row = ys.index(y)
-            y0 = row * TILE_SIZE
-            x0 = col * TILE_SIZE
-            mosaic[y0:y0 + TILE_SIZE, x0:x0 + TILE_SIZE] = arr
-        except Exception as e:
-            print(f"  Ошибка {x},{y}: {e}")
-
-    output_path = f"{OUTPUT_DIR}/{source_name}_{output_name}"
-
-    with rasterio.open(
-        output_path,
-        "w",
-        driver="GTiff",
-        height=height,
-        width=width,
-        count=3,
-        dtype=np.uint8,
-        crs="EPSG:3857",
-        transform=transform,
-        compress="lzw",
-        photometric="RGB"
-    ) as dst:
-        dst.write(mosaic[:, :, 0], 1)
-        dst.write(mosaic[:, :, 1], 2)
-        dst.write(mosaic[:, :, 2], 3)
-
-    print(f"✅ Готово: {output_path}")
-    return output_path
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    best = candidates[0]
+    return best[0], best[1]
 
 
 if __name__ == "__main__":
     tile_list = get_tile_range(LAT_MIN, LAT_MAX, LON_MIN, LON_MAX, ZOOM)
-    print(f"Всего тайлов: {len(tile_list)}")
 
-    for name, template in SOURCES.items():
-        download_all_tiles(name, template, tile_list)
+    for source_name, template in SOURCES.items():
+        download_all_tiles(source_name, template, tile_list)
 
-    for name in SOURCES.keys():
-        stitch_tiles_to_geotiff(name, tile_list, f"mosaic_{name}.tif")
+    release_num, release_date = pick_season_release(SEASON)
 
-    print("\n✅ Всё готово! Смотрим в папке:", OUTPUT_DIR)
+    wayback_name = "esri_season"
+    fmt = {"release_num": release_num}
+
+    download_all_tiles(wayback_name, WAYBACK_TILE_TEMPLATE, tile_list, extra_format=fmt)
